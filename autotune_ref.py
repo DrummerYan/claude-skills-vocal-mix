@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-参考音高修正 (Reference-guided Pitch Correction)
-用原唱的 F0 曲线作为目标，通过 DTW 对齐后纠正跑调人声。
-
-比盲修准确得多：不猜音符，直接跟着原唱的旋律走。
+参考音高修正 v2 — Praat PSOLA 引擎
+用原唱 F0 曲线作为目标，PSOLA 重合成，无电音感。
 
 用法：
     python3 autotune_ref.py \
         --input  跑调版.wav \
-        --ref    原唱（参考）.wav \
+        --ref    原唱参考.wav \
         --out    修音准完毕.wav \
         --strength 0.85
 """
@@ -16,205 +14,190 @@
 import argparse
 import numpy as np
 import soundfile as sf
-import pyworld as pw
+import parselmouth
+from parselmouth.praat import call
 from scipy.ndimage import median_filter
 from scipy.interpolate import interp1d
 
-# ── 音高提取 ─────────────────────────────────────────
-def extract_f0(audio: np.ndarray, sr: int, frame_period=5.0):
-    """用 harvest 提取 F0，返回 (f0, voiced_mask)"""
-    audio_64 = audio.astype(np.float64)
-    f0, _ = pw.harvest(audio_64, sr,
-                       f0_floor=60, f0_ceil=1100,
-                       frame_period=frame_period)
-    voiced = f0 > 0
-    return f0, voiced
+FRAME_PERIOD = 0.005  # 5ms 每帧
 
-def hz_to_cent(freq: np.ndarray) -> np.ndarray:
-    """Hz → cent（相对 A1=55Hz），便于 DTW 距离计算"""
-    out = np.zeros_like(freq)
-    mask = freq > 0
-    out[mask] = 1200 * np.log2(freq[mask] / 55.0)
-    return out
 
-def octave_align(f0_src: np.ndarray, f0_ref: np.ndarray) -> np.ndarray:
-    """
-    如果演唱者和原唱差一个八度（儿童 vs 成人很常见），自动对齐。
-    """
-    src_voiced = f0_src[f0_src > 0]
-    ref_voiced = f0_ref[f0_ref > 0]
-    if len(src_voiced) == 0 or len(ref_voiced) == 0:
-        return f0_src
+def load_mono(path: str):
+    """读取音频，转单声道 float64 供 Praat 使用"""
+    audio, sr = sf.read(path, dtype="float32", always_2d=True)
+    mono = audio.mean(axis=1).astype(np.float64)
+    return audio, mono, sr
 
-    ratio = np.median(src_voiced) / np.median(ref_voiced)
-    if 1.6 < ratio < 2.5:          # 源比参考高一个八度
-        print(f"  八度检测: 源比参考高一个八度 (比值 {ratio:.2f})，参考上移一个八度")
-        f0_ref = f0_ref * 2.0
-    elif 0.4 < ratio < 0.65:        # 源比参考低一个八度
-        print(f"  八度检测: 源比参考低一个八度 (比值 {ratio:.2f})，参考下移一个八度")
-        f0_ref = f0_ref / 2.0
-    else:
-        print(f"  八度检测: 正常 (比值 {ratio:.2f}，无需调整)")
+
+def extract_f0_praat(mono: np.ndarray, sr: int,
+                     floor=60.0, ceiling=1100.0) -> np.ndarray:
+    """用 Praat 提取 F0（比 harvest 对人声更准）"""
+    snd = parselmouth.Sound(mono, sampling_frequency=sr)
+    pitch = call(snd, "To Pitch (ac)", FRAME_PERIOD, floor, 15,
+                 False, 0.03, 0.45, 0.01, 0.35, 0.14, ceiling)
+    n_frames = call(pitch, "Get number of frames")
+    f0 = np.array([
+        call(pitch, "Get value in frame", i + 1, "Hertz")
+        for i in range(n_frames)
+    ])
+    f0 = np.where(np.isnan(f0), 0.0, f0)
+    return f0
+
+
+def octave_align_f0(f0_src: np.ndarray, f0_ref: np.ndarray) -> np.ndarray:
+    """自动检测并对齐八度差（儿童 vs 成人常见）"""
+    s = np.median(f0_src[f0_src > 0]) if np.any(f0_src > 0) else 1
+    r = np.median(f0_ref[f0_ref > 0]) if np.any(f0_ref > 0) else 1
+    ratio = s / r
+    if 1.6 < ratio < 2.5:
+        print(f"  八度修正: 参考上移一个八度 (比值 {ratio:.2f})")
+        return f0_ref * 2.0
+    elif 0.4 < ratio < 0.65:
+        print(f"  八度修正: 参考下移一个八度 (比值 {ratio:.2f})")
+        return f0_ref / 2.0
+    print(f"  八度检测: 无需调整 (比值 {ratio:.2f})")
     return f0_ref
 
-# ── DTW 对齐 ─────────────────────────────────────────
-def dtw_align(src_cents: np.ndarray, ref_cents: np.ndarray,
-              src_voiced: np.ndarray, ref_voiced: np.ndarray):
+
+def build_target_f0(f0_src: np.ndarray, f0_ref: np.ndarray,
+                    strength: float) -> np.ndarray:
     """
-    轻量 DTW：只在有声帧上做对齐，找到 src → ref 的时间映射。
-    返回：ref_aligned — 与 src 等长的参考 F0 序列
+    逐帧构建目标 F0：
+    - 两文件等长时直接插值对齐
+    - strength: 0 = 不修，1 = 完全跟原唱
     """
-    n = len(src_cents)
-    m = len(ref_cents)
+    n_src = len(f0_src)
+    n_ref = len(f0_ref)
 
-    # 构建代价矩阵（只用有声帧的 cent 距离）
-    # 降采样加速（每隔 4 帧）
-    step = 4
-    src_ds = src_cents[::step]
-    ref_ds = ref_cents[::step]
-    n_ds, m_ds = len(src_ds), len(ref_ds)
+    # 把 ref 插值到与 src 等长
+    if n_ref != n_src:
+        x_ref = np.linspace(0, n_src - 1, n_ref)
+        interp = interp1d(x_ref, f0_ref, kind="linear",
+                          bounds_error=False, fill_value=0.0)
+        f0_ref_aligned = interp(np.arange(n_src))
+    else:
+        f0_ref_aligned = f0_ref.copy()
 
-    dtw_mat = np.full((n_ds, m_ds), np.inf)
-    dtw_mat[0, 0] = abs(src_ds[0] - ref_ds[0])
-    for i in range(1, n_ds):
-        dtw_mat[i, 0] = dtw_mat[i-1, 0] + abs(src_ds[i] - ref_ds[0])
-    for j in range(1, m_ds):
-        dtw_mat[0, j] = dtw_mat[0, j-1] + abs(src_ds[0] - ref_ds[j])
-    for i in range(1, n_ds):
-        for j in range(1, m_ds):
-            cost = abs(src_ds[i] - ref_ds[j])
-            dtw_mat[i, j] = cost + min(
-                dtw_mat[i-1, j],
-                dtw_mat[i, j-1],
-                dtw_mat[i-1, j-1]
-            )
+    # 中值滤波平滑参考曲线，去掉毛刺
+    f0_ref_smooth = median_filter(f0_ref_aligned, size=9)
 
-    # 回溯路径
-    path_i, path_j = [n_ds-1], [m_ds-1]
-    i, j = n_ds-1, m_ds-1
-    while i > 0 or j > 0:
-        if i == 0:
-            j -= 1
-        elif j == 0:
-            i -= 1
-        else:
-            best = np.argmin([dtw_mat[i-1,j], dtw_mat[i,j-1], dtw_mat[i-1,j-1]])
-            if best == 0:   i -= 1
-            elif best == 1: j -= 1
-            else:           i -= 1; j -= 1
-        path_i.append(i); path_j.append(j)
-
-    path_i = np.array(path_i[::-1]) * step
-    path_j = np.array(path_j[::-1]) * step
-
-    # 插值：为 src 每一帧找到对应的 ref 帧索引
-    path_i = np.clip(path_i, 0, n-1)
-    path_j = np.clip(path_j, 0, m-1)
-    interp = interp1d(path_i, path_j, kind='linear',
-                      bounds_error=False, fill_value=(path_j[0], path_j[-1]))
-    ref_idx = interp(np.arange(n)).astype(int)
-    ref_idx = np.clip(ref_idx, 0, m-1)
-
-    # 取对应的参考 F0
-    ref_f0_raw, _ = None, None  # 在外部传入
-    return ref_idx   # 返回映射索引
-
-
-# ── 主修正函数 ────────────────────────────────────────
-def pitch_correct_with_ref(src_audio: np.ndarray, ref_audio: np.ndarray,
-                            sr: int, strength: float = 0.85,
-                            frame_period: float = 5.0) -> np.ndarray:
-    print("  提取源人声 F0...")
-    f0_src, voiced_src = extract_f0(src_audio, sr, frame_period)
-
-    print("  提取参考人声 F0...")
-    f0_ref, voiced_ref = extract_f0(ref_audio, sr, frame_period)
-
-    # 声码器完整分析（用于重合成）
-    print("  声码器分析（提取音色包络）...")
-    src_64 = src_audio.astype(np.float64)
-    _, t_src = pw.harvest(src_64, sr, frame_period=frame_period)
-    sp = pw.cheaptrick(src_64, f0_src, t_src, sr)
-    ap = pw.d4c(src_64, f0_src, t_src, sr)
-
-    # 八度对齐
-    f0_ref = octave_align(f0_src, f0_ref)
-
-    # cent 序列
-    cents_src = hz_to_cent(f0_src)
-    cents_ref = hz_to_cent(f0_ref)
-
-    # DTW 对齐：找 src 每帧对应的 ref 帧
-    print("  DTW 时间对齐...")
-    ref_idx = dtw_align(cents_src, cents_ref, voiced_src, voiced_ref)
-
-    # 中值滤波 ref F0，减少参考噪声
-    f0_ref_smooth = median_filter(f0_ref, size=5)
-
-    # 修正 F0
-    print("  修正音高...")
-    f0_corrected = f0_src.copy()
-    for i in range(len(f0_src)):
-        if not voiced_src[i]:
+    # 构建目标曲线
+    f0_target = np.zeros(n_src)
+    for i in range(n_src):
+        if f0_src[i] <= 0:
+            f0_target[i] = 0.0
             continue
-        ref_freq = f0_ref_smooth[ref_idx[i]]
-        if ref_freq <= 0:
-            # 参考帧无声：找最近的有声参考帧
-            voiced_ref_idx = np.where(f0_ref_smooth > 0)[0]
-            if len(voiced_ref_idx) == 0:
+        ref = f0_ref_smooth[i]
+        if ref <= 0:
+            # 参考无声：在附近找最近有声帧
+            voiced_idx = np.where(f0_ref_smooth > 0)[0]
+            if len(voiced_idx) == 0:
+                f0_target[i] = f0_src[i]
                 continue
-            nearest = voiced_ref_idx[np.argmin(np.abs(voiced_ref_idx - ref_idx[i]))]
-            ref_freq = f0_ref_smooth[nearest]
+            nearest = voiced_idx[np.argmin(np.abs(voiced_idx - i))]
+            ref = f0_ref_smooth[nearest]
+        # 柔性修正
+        f0_target[i] = f0_src[i] * (1 - strength) + ref * strength
 
-        src_freq = f0_src[i]
-        # 柔性插值修正
-        f0_corrected[i] = src_freq * (1 - strength) + ref_freq * strength
+    # 最终平滑（避免相邻帧跳变）
+    voiced_mask = f0_target > 0
+    if voiced_mask.sum() > 10:
+        f0_smooth = median_filter(f0_target, size=5)
+        f0_target[voiced_mask] = f0_smooth[voiced_mask]
 
-    # 重合成（音色 sp/ap 完全不变）
-    print("  重合成...")
-    corrected = pw.synthesize(f0_corrected, sp, ap, sr,
-                              frame_period=frame_period)
+    return f0_target
 
-    min_len = min(len(src_audio), len(corrected))
-    return corrected[:min_len].astype(np.float32)
+
+def apply_psola(mono_src: np.ndarray, sr: int,
+                f0_target: np.ndarray) -> np.ndarray:
+    """
+    Praat PSOLA 重合成：
+    给 Manipulation 对象替换 PitchTier，再用 overlap-add 输出。
+    音色/气声完全来自原始录音，只改音高。
+    """
+    snd = parselmouth.Sound(mono_src, sampling_frequency=sr)
+
+    # 创建 Manipulation 对象（包含原始波形 + 音高 + 时长）
+    manip = call(snd, "To Manipulation", FRAME_PERIOD, 60, 1100)
+
+    # 提取当前 PitchTier
+    pitch_tier = call(manip, "Extract pitch tier")
+
+    # 清空原有音高点
+    call(pitch_tier, "Remove points between", 0, snd.duration)
+
+    # 写入目标 F0（每帧一个点）
+    n = len(f0_target)
+    times = np.arange(n) * FRAME_PERIOD + FRAME_PERIOD / 2
+    for i in range(n):
+        if f0_target[i] > 0:
+            t = float(times[i])
+            if 0 < t < snd.duration:
+                call(pitch_tier, "Add point", t, float(f0_target[i]))
+
+    # 替换 PitchTier 并重合成
+    call([pitch_tier, manip], "Replace pitch tier")
+    snd_out = call(manip, "Get resynthesis (overlap-add)")
+
+    result = snd_out.values[0]  # parselmouth Sound → numpy
+    return result.astype(np.float32)
+
+
+def process_channel(src_mono: np.ndarray, ref_mono: np.ndarray,
+                    sr: int, strength: float) -> np.ndarray:
+    print("  提取源人声 F0 (Praat)...")
+    f0_src = extract_f0_praat(src_mono, sr)
+
+    print("  提取参考人声 F0 (Praat)...")
+    f0_ref = extract_f0_praat(ref_mono, sr)
+
+    f0_ref = octave_align_f0(f0_src, f0_ref)
+
+    print("  构建目标音高曲线...")
+    f0_target = build_target_f0(f0_src, f0_ref, strength)
+
+    voiced_ratio = np.sum(f0_target > 0) / len(f0_target)
+    print(f"  有声帧比例: {voiced_ratio*100:.1f}%  修正帧数: {np.sum(f0_target>0)}")
+
+    print("  Praat PSOLA 重合成...")
+    corrected = apply_psola(src_mono.astype(np.float64), sr, f0_target)
+
+    # 对齐长度
+    min_len = min(len(src_mono), len(corrected))
+    return corrected[:min_len]
 
 
 def main():
-    parser = argparse.ArgumentParser(description="参考音高修正")
-    parser.add_argument("--input",    required=True, help="需要修音准的干声 WAV")
-    parser.add_argument("--ref",      required=True, help="原唱参考 WAV（音高来源）")
-    parser.add_argument("--out",      default=None,  help="输出路径")
-    parser.add_argument("--strength", type=float, default=0.85, help="修正强度 0~1（默认 0.85）")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input",    required=True)
+    parser.add_argument("--ref",      required=True)
+    parser.add_argument("--out",      default=None)
+    parser.add_argument("--strength", type=float, default=0.85)
     args = parser.parse_args()
 
     if args.out is None:
         base = args.input.rsplit(".", 1)[0]
         args.out = f"{base}_参考修音准.wav"
 
-    print(f"输入: {args.input}")
-    print(f"参考: {args.ref}")
-    print(f"强度: {args.strength}")
+    print(f"输入:  {args.input}")
+    print(f"参考:  {args.ref}")
+    print(f"强度:  {args.strength}")
 
-    src_raw, sr  = sf.read(args.input, dtype="float32", always_2d=True)
-    ref_raw, sr2 = sf.read(args.ref,   dtype="float32", always_2d=True)
-
-    # 转单声道处理，分声道分别处理后合并
+    src_raw, src_mono, sr = load_mono(args.input)
+    _,       ref_mono, _  = load_mono(args.ref)
     n_ch = src_raw.shape[1]
-    ref_mono = ref_raw.mean(axis=1)   # 参考用单声道即可
 
     corrected_channels = []
     for ch in range(n_ch):
-        print(f"\n声道 {ch+1}/{n_ch}:")
-        corrected = pitch_correct_with_ref(
-            src_raw[:, ch], ref_mono, sr,
-            strength=args.strength
-        )
+        print(f"\n── 声道 {ch+1}/{n_ch} ──")
+        ch_src = src_raw[:, ch].astype(np.float64)
+        corrected = process_channel(ch_src, ref_mono, sr, args.strength)
         corrected_channels.append(corrected)
 
     result = np.stack(corrected_channels, axis=-1)
     peak = np.max(np.abs(result))
     if peak > 0.999:
-        result = result / peak * 0.999
+        result *= 0.999 / peak
 
     sf.write(args.out, result, sr, subtype="FLOAT")
     print(f"\n完成！输出: {args.out}")
