@@ -96,6 +96,12 @@ def build_target_f0(f0_src: np.ndarray, f0_ref: np.ndarray,
                 continue
             nearest = voiced_idx[np.argmin(np.abs(voiced_idx - i))]
             ref = f0_ref_smooth[nearest]
+        # 修正幅度检查：超过 5 个半音大概率是对齐错误，跳过
+        semitones = abs(12 * np.log2(ref / f0_src[i])) if ref > 0 else 99
+        if semitones > 5.0:
+            f0_target[i] = f0_src[i]   # 保持原音高不动
+            continue
+
         # 柔性修正
         f0_target[i] = f0_src[i] * (1 - strength) + ref * strength
 
