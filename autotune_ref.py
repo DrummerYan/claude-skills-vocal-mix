@@ -81,6 +81,18 @@ def build_target_f0(f0_src: np.ndarray, f0_ref: np.ndarray,
     # 中值滤波平滑参考曲线，去掉毛刺
     f0_ref_smooth = median_filter(f0_ref_aligned, size=9)
 
+    # ── Fix 1: 剔除参考 F0 中的异常帧 ──────────────────
+    # 人声分离产生的噪声帧（如 69Hz、139Hz）会污染修正目标
+    # 计算滚动中位数，超过 6 个半音的帧视为坏帧清零
+    window = 41  # 约 0.2 秒的滚动窗口
+    rolling_med = median_filter(np.where(f0_ref_smooth > 0, f0_ref_smooth, np.nan),
+                                size=window)
+    for i in range(len(f0_ref_smooth)):
+        if f0_ref_smooth[i] > 0 and rolling_med[i] > 0:
+            dev = abs(12 * np.log2(f0_ref_smooth[i] / rolling_med[i]))
+            if dev > 6.0:   # 偏离滚动中位数超过 6 个半音 → 坏帧
+                f0_ref_smooth[i] = 0.0
+
     # 构建目标曲线
     f0_target = np.zeros(n_src)
     for i in range(n_src):
@@ -105,10 +117,11 @@ def build_target_f0(f0_src: np.ndarray, f0_ref: np.ndarray,
         # 柔性修正
         f0_target[i] = f0_src[i] * (1 - strength) + ref * strength
 
-    # 最终平滑（避免相邻帧跳变）
+    # ── Fix 2: 对目标曲线做更强平滑，消除修/跳交替的锯齿 ──
+    # 修正帧和跳过帧快速交替时 PSOLA 会产生电音，需要平滑过渡
     voiced_mask = f0_target > 0
     if voiced_mask.sum() > 10:
-        f0_smooth = median_filter(f0_target, size=5)
+        f0_smooth = median_filter(f0_target, size=11)   # size 5→11，更宽的平滑窗
         f0_target[voiced_mask] = f0_smooth[voiced_mask]
 
     return f0_target
