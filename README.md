@@ -1,8 +1,8 @@
 # claude-skills-vocal-mix
 
-儿童童声流行歌「干声 → 混音 → 音画同步」完整工作流。
+音频混音与发行级母带完整工作流。
 
-在 Claude Code 里用 `/mix-vocal`、`/sync-video`、`/iterate-mix` 调用。  
+在 Claude Code 里用 `/mix-vocal`、`/sync-video`、`/iterate-mix`、`/release-master` 调用。  
 Python 脚本可直接命令行运行，不依赖 Claude。
 
 ---
@@ -33,7 +33,28 @@ python3 final_mix.py
 
 ---
 
-### 3. `sync_video.py` — 视频音画同步
+### 3. `release-master/` — 发行级母带（通用）
+
+任意 WAV 混音 → 流媒体可发行版本，基于波形实测做 EQ/动态，**每一级监控瞬态 crest**，4× 上采样 ISP-safe 限幅。
+
+```bash
+# 先分析（拿到诊断建议的 CLI 参数）
+python3 release-master/analyze.py INPUT.wav
+
+# 再母带
+python3 release-master/master.py INPUT.wav --lufs -13 --ceil -1.0
+```
+
+核心经验（实战验证）：
+- `pedalboard.Limiter` 不做 ISP 保护（ISP 可比 sample peak 高 3+ dB）→ 必须 4× 上采样 hard-clip 自己做
+- 不能一次性推响度（单次 push +2 dB 会让限幅器非线性暴走，crest 砸 6-8 dB）→ 小步 0.6 dB × N 次
+- LUFS 目标按源 crest 选（crest 22 → -14 LUFS；crest 18 → -13；crest 14 → -12）
+
+详见 `release-master/SKILL.md`。
+
+---
+
+### 4. `sync_video.py` — 视频音画同步
 原始视频 + 混音音频 → 精确对齐，视频流零损失
 
 ```bash
@@ -84,6 +105,7 @@ brew install ffmpeg
 
 | 命令 | 功能 |
 |------|------|
-| `/mix-vocal` | 执行混音流程 |
-| `/sync-video` | 音画同步 |
+| `/mix-vocal` | 儿童童声干声 → 混音流程 |
+| `/sync-video` | 视频音画同步 |
 | `/iterate-mix` | 安全迭代（带 git 保护） |
+| `/release-master` | 任意 WAV → 发行级母带（实测驱动，瞬态监控） |
